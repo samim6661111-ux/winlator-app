@@ -15,18 +15,29 @@ jobs:
       - name: Get this repo
         uses: actions/checkout@v4
 
-      - name: Check index.html
+      - name: Find index.html
         run: |
-          if [ ! -f index.html ]; then
-            echo "MISSING: index.html in the repo root. Upload it (Add file > Upload files), then re-run."
+          mkdir -p overlay/files/app/src/main/assets/launcher
+          DEST=overlay/files/app/src/main/assets/launcher/index.html
+          for z in $(find . -maxdepth 2 -name '*.zip' -not -path './.git/*'); do
+            unzip -oq "$z" -d _unzipped || true
+          done
+          F=""
+          if [ -f index.html ]; then F=index.html; fi
+          if [ -z "$F" ] && [ -f "$DEST" ]; then F="$DEST"; fi
+          if [ -z "$F" ]; then
+            F=$(find . -name index.html -not -path './.git/*' | head -1)
+          fi
+          if [ -z "$F" ]; then
+            echo "MISSING: index.html not found anywhere in the repo"
             exit 1
           fi
-          echo "index.html found"
+          echo "Using $F"
+          if [ "$F" != "$DEST" ]; then cp "$F" "$DEST"; fi
 
       - name: Create overlay files
         run: |
           mkdir -p overlay/files/app/src/main/java/com/winlator/gtaiv overlay/files/app/src/main/assets/launcher
-          cp index.html overlay/files/app/src/main/assets/launcher/index.html
           cat > overlay/apply.py <<'EOF'
           #!/usr/bin/env python3
           """Run from repo root. Copies overlay/files into the app module, auto-detects Ludashi's layout
@@ -559,6 +570,12 @@ jobs:
 
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Install glslang (shader compiler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          which glslangValidator
 
       - uses: gradle/actions/setup-gradle@v4
         with:
