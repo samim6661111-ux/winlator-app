@@ -17,7 +17,8 @@ jobs:
           sed -i 's|^\(\s*\)File desktopDir = .*getUserDir().*$|\1File desktopDir = new File(container.getRootDir(), ".wine/drive_c/users/xuser/Desktop");|' ludashi/app/src/main/java/com/winlator/cmod/LauncherActivity.java
       - name: Fix manifest package
         run: |
-          sed -i 's| package="com.winlator"||' ludashi/app/src/main/AndroidManifest.xml
+          sed -i -E 's/[[:space:]]*package="[^"]*"//' ludashi/app/src/main/AndroidManifest.xml
+          grep -n "package=" ludashi/app/src/main/AndroidManifest.xml || echo "package removed"
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
