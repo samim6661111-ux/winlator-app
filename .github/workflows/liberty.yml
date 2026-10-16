@@ -1,0 +1,48 @@
+name: Build Liberty Launcher
+on:
+  workflow_dispatch:
+    inputs:
+      ludashi_ref:
+        description: "Ludashi tag/branch to build"
+        default: "v4.1"
+      gradle_task:
+        description: "Gradle task"
+        default: "assembleDebug"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get this repo (overlay)
+        uses: actions/checkout@v4
+      - name: Get Ludashi source
+        uses: actions/checkout@v4
+        with:
+          repository: StevenMXZ/Winlator-Ludashi
+          ref: ${{ github.event.inputs.ludashi_ref || 'v4.1' }}
+          path: src
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: src
+      - name: Apply GTA IV overlay
+        working-directory: src
+        env:
+          APP_ID: ${{ vars.APP_ID || 'com.gtaiv.ludashi' }}
+          APP_NAME: ${{ vars.APP_NAME || 'Liberty Launcher' }}
+        run: |
+          cp -r ../overlay ./overlay
+          python3 overlay/apply.py
+      - name: Build
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew ${{ github.event.inputs.gradle_task || 'assembleDebug' }} --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-Launcher
+          path: src/app/build/outputs/apk/**/*.apk
