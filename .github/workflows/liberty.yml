@@ -12,8 +12,537 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Get this repo (overlay)
+      - name: Get this repo
         uses: actions/checkout@v4
+
+      - name: Check index.html
+        run: |
+          if [ ! -f index.html ]; then
+            echo "MISSING: index.html in the repo root. Upload it (Add file > Upload files), then re-run."
+            exit 1
+          fi
+          echo "index.html found"
+
+      - name: Create overlay files
+        run: |
+          mkdir -p overlay/files/app/src/main/java/com/winlator/gtaiv overlay/files/app/src/main/assets/launcher
+          cp index.html overlay/files/app/src/main/assets/launcher/index.html
+          cat > overlay/apply.py <<'EOF'
+          #!/usr/bin/env python3
+          """Run from repo root. Copies overlay/files into the app module, auto-detects Ludashi's layout
+          (source dir, XServerDisplayActivity package) and patches manifest / app id / app name."""
+          import os, re, shutil, sys
+
+          ROOT = os.getcwd()
+          APP = os.path.join(ROOT, "app")
+          SRC = os.path.join(ROOT, "overlay", "files")
+
+          def read(p): return open(p, encoding="utf-8", errors="ignore").read()
+          def write(p, t): open(p, "w", encoding="utf-8").write(t)
+          def die(m): print("ERROR:", m); sys.exit(1)
+
+          if not os.path.isdir(APP): die("no app/ folder - is this the Ludashi source branch?")
+          gradles = [os.path.join(APP, g) for g in ("build.gradle", "build.gradle.kts") if os.path.exists(os.path.join(APP, g))]
+          if not gradles: die("app/build.gradle not found")
+
+          # --- 1. info ---
+          for g in gradles:
+              t = read(g)
+              for k in ("versionName", "applicationId", "namespace"):
+                  for m in re.finditer(k + r'\s*=?\s*["\']([^"\']+)["\']', t):
+                      print("INFO", k, "=", m.group(1))
+              print("INFO flavors:", re.findall(r'^\s*(\w+)\s*\{\s*(?:\n\s*)?(?:dimension|applicationId)', t, re.M))
+
+          # --- 2. where does Java live? (honour custom sourceSets) ---
+          java_rel = "src/main/java"
+          for g in gradles:
+              m = re.search(r'srcDirs?\s*[=+(]*\s*\[?\s*["\']([^"\']+)["\']', read(g))
+              if m and "build/" not in m.group(1): java_rel = m.group(1).lstrip("./"); break
+          print("INFO java source dir: app/" + java_rel)
+
+          # --- 3. copy overlay ---
+          copied = []
+          for dp, _, fns in os.walk(SRC):
+              for fn in fns:
+                  s = os.path.join(dp, fn)
+                  rel = os.path.relpath(s, SRC)                       # app/src/main/...
+                  if "/src/main/java/" in rel.replace("\\", "/"):
+                      rel = "app/" + java_rel.rstrip("/") + "/" + rel.replace("\\", "/").split("/src/main/java/", 1)[1]
+                  d = os.path.join(ROOT, rel)
+                  os.makedirs(os.path.dirname(d), exist_ok=True)
+                  shutil.copyfile(s, d)
+                  copied.append(d)
+                  print("copied", rel)
+
+          # --- 4. find Winlator's XServerDisplayActivity and point GameLauncher at it ---
+          found = None
+          for dp, _, fns in os.walk(APP):
+              if "/build/" in dp.replace("\\", "/"): continue
+              for fn in fns:
+                  if re.fullmatch(r"XServerDisplayActivity\.(java|kt)", fn):
+                      t = read(os.path.join(dp, fn))
+                      pk = re.search(r"^\s*package\s+([\w.]+)", t, re.M)
+                      found = (pk.group(1) + "." if pk else "") + "XServerDisplayActivity"
+                      for extra in ("container_id", "shortcut_path"):
+                          print("INFO extra", extra, "->", "found" if ('"%s"' % extra) in t else "NOT FOUND in XServerDisplayActivity")
+                      break
+              if found: break
+          if found:
+              print("INFO XServerDisplayActivity =", found)
+              for d in copied:
+                  if d.endswith("GameLauncher.java"):
+                      write(d, re.sub(r'XSERVER_ACTIVITY\s*=\s*"[^"]*"', 'XSERVER_ACTIVITY = "%s"' % found, read(d)))
+          else:
+              print("WARN XServerDisplayActivity not found - GameLauncher keeps its default class name")
+
+          # --- 5. manifest ---
+          mf = os.path.join(APP, "src/main/AndroidManifest.xml")
+          if not os.path.exists(mf): die("AndroidManifest.xml not found")
+          t = read(mf)
+          if "com.winlator.gtaiv.LauncherActivity" not in t:
+              t = re.sub(r'\s*<category\s+android:name="android\.intent\.category\.LAUNCHER"\s*/>', "", t)
+              act = '''
+                  <activity android:name="com.winlator.gtaiv.LauncherActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+          '''
+              t = t.replace("</application>", act + "    </application>", 1)
+              perms = ""
+              for p in ["MANAGE_EXTERNAL_STORAGE", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"]:
+                  if "android.permission." + p not in t:
+                      perms += '    <uses-permission android:name="android.permission.%s"/>\n' % p
+              t = re.sub(r"(<application\b)", perms + r"    \1", t, count=1)
+              write(mf, t)
+              print("manifest patched")
+
+          # --- 6. app id / name ---
+          new_id = os.environ.get("APP_ID")
+          if new_id:
+              for g in gradles:
+                  c = read(g)
+                  c2 = re.sub(r'(applicationId\s*=?\s*)"[^"]+"', r'\1"%s"' % new_id, c)
+                  if c2 != c: write(g, c2); print("applicationId ->", new_id)
+          name = os.environ.get("APP_NAME")
+          if name:
+              for dp, _, fns in os.walk(os.path.join(APP, "src/main/res")):
+                  if os.path.basename(dp).startswith("values") and "strings.xml" in fns:
+                      sp = os.path.join(dp, "strings.xml")
+                      c = read(sp)
+                      c2 = re.sub(r'(<string\s+name="app_name"[^>]*>)[^<]*(</string>)', r'\g<1>%s\g<2>' % name.replace("&", "&amp;"), c)
+                      if c2 != c: write(sp, c2); print("app_name ->", name)
+          print("DONE")
+          EOF
+          cat > overlay/files/app/src/main/java/com/winlator/gtaiv/LauncherActivity.java <<'EOF'
+          package com.winlator.gtaiv;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+
+          /** Full-screen WebView host for assets/launcher/index.html */
+          public class LauncherActivity extends Activity {
+              private WebView web;
+              private NativeBridge bridge;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  web = new WebView(this);
+                  web.setBackgroundColor(0xFF03070F);
+                  WebSettings ws = web.getSettings();
+                  ws.setJavaScriptEnabled(true);
+                  ws.setDomStorageEnabled(true);
+                  ws.setAllowFileAccess(true);
+                  ws.setBuiltInZoomControls(false);
+                  web.setOverScrollMode(View.OVER_SCROLL_NEVER);
+                  bridge = new NativeBridge(this, web);
+                  web.addJavascriptInterface(bridge, "Native");
+                  setContentView(web);
+                  web.loadUrl("file:///android_asset/launcher/index.html");
+                  ensureStorageAccess();
+              }
+
+              private void ensureStorageAccess() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          if (!Environment.isExternalStorageManager()) {
+                              try {
+                                  startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                          Uri.parse("package:" + getPackageName())));
+                              } catch (Exception e) {
+                                  startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                              }
+                          }
+                      } else if (Build.VERSION.SDK_INT >= 23) {
+                          requestPermissions(new String[]{
+                                  android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                                  android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  hideBars();
+                  if (bridge != null) bridge.onResumed();
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) hideBars();
+              }
+
+              private void hideBars() {
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  // JS decides: close browser / go home / call Native.exit()
+                  web.evaluateJavascript("window.onBack&&window.onBack()", null);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (web != null) { web.removeAllViews(); web.destroy(); }
+                  super.onDestroy();
+              }
+          }
+          EOF
+          cat > overlay/files/app/src/main/java/com/winlator/gtaiv/NativeBridge.java <<'EOF'
+          package com.winlator.gtaiv;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Environment;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+
+          /** window.Native used by index.html. @JavascriptInterface methods run on a WebView background thread. */
+          public class NativeBridge {
+              static final String[] ALL_FLAGS = {"-nomemrestrict", "-norestrictions", "-novblank", "-noprecache", "-windowed"};
+              private static final String EXE = "GTAIV.exe";
+              private static final String[] MOD_DIRS = {"", "plugins", "scripts"};
+
+              private final Activity act;
+              private final WebView web;
+              private final SharedPreferences sp;
+
+              public NativeBridge(Activity act, WebView web) {
+                  this.act = act;
+                  this.web = web;
+                  this.sp = act.getSharedPreferences("gtaiv_launcher", Context.MODE_PRIVATE);
+              }
+
+              /* ---------------- helpers ---------------- */
+              private void js(final String code) {
+                  act.runOnUiThread(new Runnable() { public void run() { web.evaluateJavascript(code, null); } });
+              }
+
+              private void toast(final String m) {
+                  act.runOnUiThread(new Runnable() { public void run() { Toast.makeText(act, m, Toast.LENGTH_SHORT).show(); } });
+              }
+
+              static File findExe(File dir) {
+                  if (dir == null) return null;
+                  File[] kids = dir.listFiles();
+                  if (kids == null) return null;
+                  for (File f : kids) if (f.isFile() && f.getName().equalsIgnoreCase(EXE)) return f;
+                  return null;
+              }
+
+              private String folder() { return sp.getString("gameFolder", ""); }
+
+              private String stateJson() {
+                  try {
+                      File exe = folder().isEmpty() ? null : findExe(new File(folder()));
+                      JSONObject s = new JSONObject();
+                      s.put("gameFolder", folder());
+                      s.put("exeFound", exe != null);
+                      s.put("gameVersion", "");
+                      s.put("lastPlayed", sp.getLong("lastPlayed", 0));
+                      s.put("totalMs", sp.getLong("totalMs", 0));
+                      s.put("engineReady", sp.getBoolean("engineReady", false));
+                      JSONObject st = new JSONObject();
+                      st.put("resolution", sp.getString("resolution", "1280x720"));
+                      st.put("driver", sp.getString("driver", "auto"));
+                      st.put("dxvk", sp.getString("dxvk", "auto"));
+                      st.put("hud", sp.getBoolean("hud", false));
+                      JSONArray fl = new JSONArray();
+                      String csv = sp.getString("flags", "-nomemrestrict,-norestrictions,-novblank");
+                      if (!csv.isEmpty()) for (String f : csv.split(",")) fl.put(f);
+                      st.put("flags", fl);
+                      s.put("settings", st);
+                      return s.toString();
+                  } catch (Exception e) { return "{}"; }
+              }
+
+              private void push() { js("window.onState&&window.onState(" + stateJson() + ")"); }
+
+              /** Called from LauncherActivity.onResume: add play time after returning from the game. */
+              void onResumed() {
+                  long start = sp.getLong("sessionStart", 0);
+                  if (start > 0) {
+                      long add = Math.max(0, System.currentTimeMillis() - start);
+                      sp.edit().putLong("totalMs", sp.getLong("totalMs", 0) + add).putLong("sessionStart", 0).apply();
+                  }
+                  push();
+              }
+
+              private List<String> rootList() {
+                  List<String> r = new ArrayList<>();
+                  File internal = Environment.getExternalStorageDirectory();
+                  if (internal != null && internal.canRead()) r.add(internal.getAbsolutePath());
+                  File[] st = new File("/storage").listFiles();
+                  if (st != null) for (File f : st) {
+                      String n = f.getName();
+                      if (n.equals("emulated") || n.equals("self") || !f.canRead()) continue;
+                      r.add(f.getAbsolutePath());
+                  }
+                  return r;
+              }
+
+              /* ---------------- bridge API ---------------- */
+              @JavascriptInterface public void ready() { push(); }
+
+              @JavascriptInterface public void exit() {
+                  act.runOnUiThread(new Runnable() { public void run() { act.finish(); } });
+              }
+
+              @JavascriptInterface public String allFlags() { return new JSONArray(Arrays.asList(ALL_FLAGS)).toString(); }
+
+              @JavascriptInterface public String roots() { return new JSONArray(rootList()).toString(); }
+
+              @JavascriptInterface public void pickFolder() { js("window.onOpenBrowser&&window.onOpenBrowser()"); }
+
+              @JavascriptInterface public String listDir(String p) {
+                  try {
+                      File dir = new File(p);
+                      JSONObject o = new JSONObject();
+                      o.put("path", dir.getAbsolutePath());
+                      String parent = rootList().contains(dir.getAbsolutePath()) ? "" : (dir.getParent() == null ? "" : dir.getParent());
+                      o.put("parent", parent);
+                      o.put("hasExe", findExe(dir) != null);
+                      File[] kids = dir.listFiles();
+                      o.put("denied", kids == null);
+                      JSONArray dirs = new JSONArray();
+                      if (kids != null) {
+                          List<File> ds = new ArrayList<>();
+                          for (File k : kids) if (k.isDirectory() && !k.getName().startsWith(".")) ds.add(k);
+                          Collections.sort(ds, new Comparator<File>() {
+                              public int compare(File a, File b) { return a.getName().compareToIgnoreCase(b.getName()); }
+                          });
+                          for (File k : ds) {
+                              JSONObject d = new JSONObject();
+                              d.put("name", k.getName());
+                              d.put("path", k.getAbsolutePath());
+                              d.put("hasExe", findExe(k) != null);
+                              dirs.put(d);
+                          }
+                      }
+                      o.put("dirs", dirs);
+                      return o.toString();
+                  } catch (Exception e) { return "{}"; }
+              }
+
+              @JavascriptInterface public void setFolder(String p) {
+                  File d = new File(p);
+                  if (findExe(d) == null) toast("Ei folder e GTAIV.exe nai.");
+                  sp.edit().putString("gameFolder", d.getAbsolutePath()).apply();
+                  push();
+              }
+
+              @JavascriptInterface public void scan() {
+                  new Thread(new Runnable() { public void run() {
+                      JSONArray out = new JSONArray();
+                      long deadline = System.currentTimeMillis() + 90000;
+                      for (String r : rootList()) walk(new File(r), 0, out, deadline);
+                      js("window.onScan&&window.onScan(" + out.toString() + ")");
+                  } }).start();
+              }
+
+              private void walk(File dir, int depth, JSONArray out, long deadline) {
+                  if (depth > 7 || System.currentTimeMillis() > deadline) return;
+                  File[] kids = dir.listFiles();
+                  if (kids == null) return;
+                  for (File k : kids) {
+                      if (k.isFile() && k.getName().equalsIgnoreCase(EXE)) out.put(k.getAbsolutePath());
+                  }
+                  for (File k : kids) {
+                      String n = k.getName();
+                      if (!k.isDirectory() || n.startsWith(".") || (depth == 0 && n.equals("Android"))) continue;
+                      walk(k, depth + 1, out, deadline);
+                  }
+              }
+
+              @JavascriptInterface public void setSetting(String k, String v) {
+                  SharedPreferences.Editor e = sp.edit();
+                  if ("hud".equals(k)) e.putBoolean("hud", "true".equals(v));
+                  else if ("flags".equals(k) || "resolution".equals(k) || "driver".equals(k) || "dxvk".equals(k)) e.putString(k, v == null ? "" : v);
+                  e.apply();
+                  push();
+              }
+
+              /* ---------------- ASI mods ---------------- */
+              @JavascriptInterface public void listMods() {
+                  new Thread(new Runnable() { public void run() {
+                      JSONArray arr = new JSONArray();
+                      try {
+                          String f = folder();
+                          if (!f.isEmpty()) for (String sub : MOD_DIRS) {
+                              File d = sub.isEmpty() ? new File(f) : new File(f, sub);
+                              File[] kids = d.listFiles();
+                              if (kids == null) continue;
+                              Arrays.sort(kids, new Comparator<File>() {
+                                  public int compare(File a, File b) { return a.getName().compareToIgnoreCase(b.getName()); }
+                              });
+                              for (File k : kids) {
+                                  String n = k.getName().toLowerCase();
+                                  boolean on = n.endsWith(".asi"), off = n.endsWith(".asi.disabled");
+                                  if (!k.isFile() || (!on && !off)) continue;
+                                  JSONObject m = new JSONObject();
+                                  m.put("name", off ? k.getName().substring(0, k.getName().length() - 9) : k.getName());
+                                  m.put("where", sub.isEmpty() ? "/" : "/" + sub);
+                                  m.put("enabled", on);
+                                  m.put("path", k.getAbsolutePath());
+                                  arr.put(m);
+                              }
+                          }
+                      } catch (Exception ignored) {}
+                      js("window.onMods&&window.onMods(" + arr.toString() + ")");
+                  } }).start();
+              }
+
+              @JavascriptInterface public void toggleMod(String path, boolean enable) {
+                  File f = new File(path);
+                  String n = f.getName();
+                  File to = null;
+                  if (enable && n.toLowerCase().endsWith(".asi.disabled")) to = new File(f.getParentFile(), n.substring(0, n.length() - 9));
+                  else if (!enable && n.toLowerCase().endsWith(".asi")) to = new File(f.getParentFile(), n + ".disabled");
+                  if (to != null && !f.renameTo(to)) toast("Mod rename failed");
+                  listMods();
+              }
+
+              /* ---------------- play ---------------- */
+              @JavascriptInterface public void play() {
+                  final File exe = folder().isEmpty() ? null : findExe(new File(folder()));
+                  if (exe == null) { js("window.onNeedFolder&&window.onNeedFolder()"); return; }
+                  sp.edit().putLong("lastPlayed", System.currentTimeMillis())
+                          .putLong("sessionStart", System.currentTimeMillis()).apply();
+                  final GameLauncher.Config c = new GameLauncher.Config();
+                  c.exe = exe;
+                  c.resolution = sp.getString("resolution", "1280x720");
+                  c.driver = sp.getString("driver", "auto");
+                  c.dxvk = sp.getString("dxvk", "auto");
+                  c.hud = sp.getBoolean("hud", false);
+                  c.flags = sp.getString("flags", "");
+                  act.runOnUiThread(new Runnable() { public void run() {
+                      try {
+                          GameLauncher.launch(act, c);
+                          sp.edit().putBoolean("engineReady", true).apply();
+                      } catch (Throwable t) {
+                          sp.edit().putLong("sessionStart", 0).apply();
+                          Toast.makeText(act, "Launch failed: " + t, Toast.LENGTH_LONG).show();
+                          push();
+                      }
+                  } });
+              }
+          }
+          EOF
+          cat > overlay/files/app/src/main/java/com/winlator/gtaiv/GameLauncher.java <<'EOF'
+          package com.winlator.gtaiv;
+
+          import android.app.Activity;
+          import android.content.Intent;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+
+          /**
+           * The ONLY file that touches Winlator internals. It writes a .desktop shortcut into a container and
+           * starts Winlator's XServerDisplayActivity with it (same mechanism as home-screen shortcuts).
+           * Class / extra names below follow Winlator Bionic; verify them against the Ludashi 4.1 source.
+           */
+          public class GameLauncher {
+              // ---- adjust these to match Ludashi 4.1 ----
+              static final String XSERVER_ACTIVITY = "com.winlator.XServerDisplayActivity";
+              static final int CONTAINER_ID = 1;          // container to run the game in
+              static final String EXTRA_CONTAINER = "container_id";
+              static final String EXTRA_SHORTCUT = "shortcut_path";
+
+              public static class Config {
+                  public File exe;
+                  public String resolution, driver, dxvk, flags;
+                  public boolean hud;
+              }
+
+              public static void launch(Activity a, Config c) throws Exception {
+                  File home = new File(a.getFilesDir(), "imagefs/home/xuser-" + CONTAINER_ID);
+                  File desktop = new File(home, ".wine/drive_c/users/xuser/Desktop");
+                  if (!desktop.isDirectory() && !desktop.mkdirs())
+                      throw new IllegalStateException("Container " + CONTAINER_ID + " not found. Create it once in Winlator first.");
+                  File sc = new File(desktop, "GTAIV.desktop");
+
+                  StringBuilder s = new StringBuilder();
+                  s.append("[Desktop Entry]\nName=GTA IV\nType=Application\nStartupWMClass=explorer\n");
+                  s.append("Exec=env WINEPREFIX=\"/home/xuser/.wine\" wine \"").append(winPath(c.exe)).append("\"");
+                  if (c.flags != null && !c.flags.isEmpty()) s.append(' ').append(c.flags.replace(',', ' '));
+                  s.append("\nPath=").append(c.exe.getParent()).append("\n\n[Extra Data]\n");
+                  s.append("screenSize=").append(c.resolution).append('\n');
+                  if (!"auto".equals(c.driver)) s.append("graphicsDriver=").append(c.driver).append('\n');
+                  s.append("dxwrapper=dxvk\n");
+                  if (!"auto".equals(c.dxvk)) s.append("dxwrapperConfig=version=").append(c.dxvk).append('\n');
+                  s.append("showFPS=").append(c.hud ? "1" : "0").append('\n');
+                  FileOutputStream o = new FileOutputStream(sc);
+                  o.write(s.toString().getBytes("UTF-8"));
+                  o.close();
+
+                  Intent i = new Intent(a, Class.forName(XSERVER_ACTIVITY));
+                  i.setAction(Intent.ACTION_MAIN);
+                  i.putExtra(EXTRA_CONTAINER, CONTAINER_ID);
+                  i.putExtra(EXTRA_SHORTCUT, sc.getPath());
+                  a.startActivity(i);
+              }
+
+              /** Path of the exe as Wine sees it. Winlator maps Android storage to a drive in container settings
+               *  (e.g. D: = /storage/emulated/0/Download). Change this to match the drive you mapped. */
+              static String winPath(File exe) {
+                  return "Z:" + exe.getAbsolutePath().replace('/', '\\');
+              }
+          }
+          EOF
+          echo "overlay files created"
 
       - name: Get Ludashi source
         uses: actions/checkout@v4
