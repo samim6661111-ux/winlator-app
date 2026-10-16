@@ -12,6 +12,9 @@ jobs:
           cd ludashi && git submodule update --init --recursive
       - name: Add launcher
         run: unzip -o GTAIV-Ludashi-overlay.zip -d ludashi
+              - name: Fix LauncherActivity
+        run: |
+          sed -i 's|new File(container.getUserDir(), "Desktop")|new File(container.getRootDir(), ".wine/drive_c/users/xuser/Desktop")|' ludashi/app/src/main/java/com/winlator/cmod/LauncherActivity.java
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
