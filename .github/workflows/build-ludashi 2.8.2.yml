@@ -1,0 +1,26 @@
+name: Build Ludashi APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get Ludashi 2.8.2 source
+        run: |
+          git clone --depth 1 --branch 2.8.2 https://github.com/StevenMXZ/Winlator-Ludashi ludashi
+          cd ludashi && git submodule update --init --recursive
+      - name: Add launcher
+        run: unzip -o GTAIV-Ludashi-overlay.zip -d ludashi
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Build
+        working-directory: ludashi
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GTAIV-Ludashi-apk
+          path: ludashi/app/build/outputs/apk/debug/app-debug.apk
