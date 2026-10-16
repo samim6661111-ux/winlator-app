@@ -11,7 +11,7 @@ jobs:
           git clone --depth 1 --branch 2.8.2 https://github.com/StevenMXZ/Winlator-Ludashi ludashi
           cd ludashi && git submodule update --init --recursive
       - name: Add launcher
-        run: unzip -o GTAIV-Ludashi-overlay.zip -d ludashi
+        run: unzip -o GTAIV-Launcher-overlay.zip -d ludashi
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
