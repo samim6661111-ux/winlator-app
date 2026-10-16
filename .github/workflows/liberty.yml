@@ -14,6 +14,7 @@ jobs:
     steps:
       - name: Get this repo (overlay)
         uses: actions/checkout@v4
+
       - name: Get Ludashi source
         uses: actions/checkout@v4
         with:
@@ -21,14 +22,19 @@ jobs:
           ref: ${{ github.event.inputs.ludashi_ref || 'v4.1' }}
           path: src
           submodules: recursive
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           build-root-directory: src
+
       - name: Apply GTA IV overlay
         working-directory: src
         env:
@@ -37,12 +43,16 @@ jobs:
         run: |
           cp -r ../overlay ./overlay
           python3 overlay/apply.py
+
       - name: Build
         working-directory: src
         run: |
           chmod +x gradlew
           ./gradlew ${{ github.event.inputs.gradle_task || 'assembleDebug' }} --no-daemon
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: Liberty-Launcher
           path: src/app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
