@@ -8,10 +8,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Get Ludashi 2.8.2 source
         run: |
-          git clone --depth 1 --branch 2.8.2 https://github.com/StevenMXZ/Winlator-Ludashi ludashi
+          git clone --depth 1 --branch 2.8.2 https://github.com/StevenMXZ/Winlator-Ludashi.git ludashi
           cd ludashi && git submodule update --init --recursive
       - name: Add launcher
-        run: unzip -o GTAIV-Launcher-overlay.zip -d ludashi
+        run: unzip -o GTAIV-Ludashi-overlay.zip -d ludashi
+      - name: Fix LauncherActivity
+        run: |
+          sed -i 's|^\(\s*\)File desktopDir = .*getUserDir().*$|\1File desktopDir = new File(container.getRootDir(), ".wine/drive_c/users/xuser/Desktop");|' ludashi/app/src/main/java/com/winlator/cmod/LauncherActivity.java
+      - name: Fix manifest package
+        run: |
+          sed -i 's| package="com.winlator"||' ludashi/app/src/main/AndroidManifest.xml
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
